@@ -1,96 +1,201 @@
+## nimscreen.nim
+## A minimal Unix-only "screen"-like terminal multiplexer written in Nim.
+##
+## This program launches a shell in a detached pseudo-terminal (PTY) session.
+## You can attach to this session via a Unix domain socket and later detach by
+## pressing Ctrl-A then d.
+##
+## Usage:
+##   Start a new session: ./nimscreen new
+##   Attach to a session: ./nimscreen attach
+
+import posix, os, termios
+
+const
+  SESSION_SOCKET* = "/tmp/nsock"
+  DETACH_SEQ*      = "\x01d"  # Ctrl-A then d
+
+## ─── C-BINDINGS FOR forkpty AND cfmakeraw ───────────────────────────────
+
 {.passL: "-lutil".}
-import posix, os, strutils, terminal
-
-# Define TWinSize struct for handling terminal window size changes
-type
-  TWinSize {.importc: "struct winsize", header: "<sys/ioctl.h>".} = object
-    ws_row: cuint
-    ws_col: cuint
-    ws_xpixel: cuint
-    ws_ypixel: cuint
-
 proc forkpty(master: ptr cint, name: cstring, termp: pointer, winp: pointer): cint
   {.importc, header: "<pty.h>".}
 
-const
-  TIOCGWINSZ* = 0x5413  # Request window size
-  TIOCSWINSZ* = 0x5414  # Set window size
-  SIGWINCH* = 28  # Signal number for window size change (POSIX standard)
+proc cfmakeraw(t: pointer) {.cdecl, importc: "cfmakeraw", header: "<termios.h>".}
 
-# Handle terminal window resizing (SIGWINCH)
-proc resizeHandler(masterFd: cint) {.noconv.} =
-  var ws: TWinSize
-  discard ioctl(STDOUT_FILENO, TIOCGWINSZ, addr ws)
-  discard ioctl(masterFd, TIOCSWINSZ, addr ws)
+## ─── UTILITY: UNIX DOMAIN SOCKET ADDRESS ───────────────────────────────
 
-# Handle child process termination (SIGCHLD)
-proc sigchldHandler {.noconv.} =
-  var status: cint
-  while waitpid(-1, status, WNOHANG) > 0:
-    echo "Child process exited with status: ", status
-    quit(0)
+proc initSockAddr*(path: string): SockAddr =
+  ## Initializes a Unix domain socket address with the given path.
+  var sa: SockAddr
+  sa.sa_family = 1
 
-# Setup signal handlers for proper process management
-proc setupSignals(masterFd: cint) =
-  var act: SigAction
-  act.saHandler = cast[proc (signal: cint) {.noconv.}](sigchldHandler)
-  discard sigaction(SIGCHLD, act, nil)
+  for i in 0 ..< sa.sa_data.len:
+    sa.sa_data[i] = '0'
 
-  act.saHandler = cast[proc (signal: cint) {.noconv.}](resizeHandler)
-  discard sigaction(SIGWINCH, act, nil)
+  for i in 0 ..< path.len:
+    sa.sa_data[i] = char(path[i].ord)
 
-# Main I/O loop for interacting with the PTY
-proc ioLoop(masterFd: cint) =
-  var readfds: TFdSet
+  return sa
+
+## ─── TERMINAL RAW-MODE HELPERS ───────────────────────────────────────────
+
+proc enableRawMode(fd: cint): Termios =
+  ## Puts the file descriptor (e.g. STDIN_FILENO) into raw mode.
+  ## Returns the original terminal settings.
+  var term: Termios
+  if tcGetAttr(fd, addr term) != cint(0):
+    raise newException(OSError, "tcgetattr failed")
+  let orig = term
+  cfmakeraw(addr term)
+  if tcSetAttr(fd, TCSANOW, addr term) != cint(0):
+    raise newException(OSError, "tcsetattr failed")
+  orig
+
+proc disableRawMode(fd: cint, orig: Termios) =
+  ## Restores the terminal settings from orig.
+  discard tcSetAttr(fd, TCSANOW, addr orig)
+
+## ─── HELPER: DATA FORWARDING ──────────────────────────────────────────────
+
+proc forwardData(srcFd, dstFd: cint) =
+  ## Forwards data from srcFd to dstFd until an error occurs or EOF is reached.
   var buf: array[1024, char]
-
   while true:
-    FD_ZERO(readfds)
-    FD_SET(masterFd, readfds)
-    FD_SET(STDIN_FILENO, readfds)
-    let nfds = max(masterFd, STDIN_FILENO) + 1
-
-    let ready = select(nfds, addr readfds, nil, nil, nil)
-    if ready < 0:
-      echo "select error: ", strerror(errno)
+    let n = read(srcFd, addr buf, sizeof(buf))
+    if n <= 0:
+      break
+    if write(dstFd, addr buf, n) <= 0:
       break
 
-    if FD_ISSET(masterFd, readfds) != 0:
-      let count = read(masterFd, addr buf[0], 1024)
-      if count <= 0: break  # pty closed or error
-      discard posix.write(STDOUT_FILENO, addr buf, count)
+## ─── SERVER MODE: NEW SESSION ─────────────────────────────────────────────
 
-    if FD_ISSET(STDIN_FILENO, readfds) != 0:
-      let count = read(STDIN_FILENO, addr buf, sizeof(buf))
-      if count <= 0: break  # stdin closed or error
-      discard posix.write(masterFd, addr buf, count)
+proc runServer*() =
+  ## Creates a new session. This starts a shell in a pseudo-terminal
+  ## and listens on a Unix domain socket for client connections.
+  if fileExists(SESSION_SOCKET):
+    try:
+      removeFile(SESSION_SOCKET)
+    except OSError:
+      discard
 
-# Main process logic
-proc main() =
-  var masterFd: cint
-  let pid = forkpty(addr masterFd, nil, nil, nil)
+  let listenfd = socket(AF_UNIX, SOCK_STREAM, 0)
+  if listenfd == INVALID_SOCKET:
+    raise newException(OSError, "socket error")
 
+  var uaddr = initSockAddr(SESSION_SOCKET)
+  if bindSocket(listenfd, addr uaddr, SockLen(sizeof(uaddr))) != cint(0):
+    raise newException(OSError, "bind error")
+  if listen(listenfd, 5) != 0:
+    raise newException(OSError, "listen error")
+  echo "Session socket created at ", SESSION_SOCKET
+
+  var master: cint
+  let pid = forkpty(addr master, nil, nil, nil)
   if pid < 0:
-    echo "forkpty failed: ", strerror(errno)
-    quit(1)
+    raise newException(OSError, "forkpty error")
   elif pid == 0:
-    var shell = os.getenv("SHELL")
-    if shell.len == 0:
-      shell = "/bin/sh"
-
-    var args = allocCStringArray([shell])
-    discard execvp(shell.cstring, args)
-
-    echo "execvp failed: ", strerror(errno)
-    quit(127)
+    ## Child process: execute the shell.
+    var sh = getEnv("SHELL")
+    if sh.len == 0:
+      sh = "/bin/sh"
+    var args = allocCStringArray(["sh"])
+    discard execvp(sh.cstring, args)
+    raise newException(OSError, "execvp failed")
   else:
-    echo "Spawned shell with pty master fd: ", masterFd
-    setupSignals(masterFd)
-    ioLoop(masterFd)
+    echo "Shell started with PID ", pid
+    echo "Waiting for client connections..."
+    var buf: array[1024, char]
+    while true:
+      let clientfd = accept(listenfd, nil, nil)
+      if clientfd == INVALID_SOCKET:
+        continue
+      echo "Client attached."
+      ## Client connection loop: forward data between PTY master and client.
+      while true:
+        var rfds: TFdSet
+        FD_ZERO(rfds)
+        FD_SET(master, rfds)
+        FD_SET(clientfd, rfds)
+        let nfds = max(int(master), int(clientfd)) + 1
+        let ret = select(nfds.cint, addr rfds, nil, nil, nil)
+        if ret <= 0:
+          break
+        if FD_ISSET(master, rfds) != 0:
+          let n = read(master, addr buf, sizeof(buf))
+          if n <= 0: break
+          if write(cint(clientfd), addr buf, n) <= 0: break
+        if FD_ISSET(clientfd, rfds) != 0:
+          let n = read(cint(clientfd), addr buf, sizeof(buf))
+          if n <= 0: break
+          if write(master, addr buf, n) <= 0: break
+      echo "Client detached."
+      discard close(clientfd)
+    discard close(listenfd)
+    try:
+      removeFile(SESSION_SOCKET)
+    except OSError:
+      discard
 
-    var status: cint
-    discard waitpid(pid, status, 0)
-    echo "Child exited with status ", status
+## ─── CLIENT MODE: ATTACH TO SESSION ─────────────────────────────────────-
 
-if isMainModule:
-  main()
+proc attachSession*() =
+  ## Attaches to an existing PTY session via the Unix domain socket.
+  ## Puts STDIN in raw mode so that keystrokes are transmitted directly.
+  let sockfd = socket(AF_UNIX, SOCK_STREAM, 0)
+  if sockfd == INVALID_SOCKET:
+    raise newException(OSError, "socket error")
+  let uaddr = initSockAddr(SESSION_SOCKET)
+  if connect(sockfd, addr uaddr, SockLen(sizeof(uaddr))) != 0:
+    raise newException(OSError, "connect error")
+  echo "Attached to session. (Press Ctrl-A then d to detach.)"
+  let origTerm = enableRawMode(STDIN_FILENO)
+  defer:
+    disableRawMode(STDIN_FILENO, origTerm)
+    discard close(sockfd)
+    echo "\nDetached from session."
+
+  var buf: array[1024, char]
+  while true:
+    var rfds: TFdSet
+    FD_ZERO(rfds)
+    FD_SET(STDIN_FILENO, rfds)
+    FD_SET(sockfd, rfds)
+    let nfds = max(int(STDIN_FILENO), int(sockfd)) + 1
+    let ret = select(nfds.cint, addr rfds, nil, nil, nil)
+    if ret <= 0:
+      break
+    if FD_ISSET(STDIN_FILENO, rfds) != 0:
+      let n = read(STDIN_FILENO, addr buf, sizeof(buf))
+      if n <= 0:
+        break
+      ## Check for the detach sequence (Ctrl-A then d).
+      if n >= 2 and buf[0] == '\x01' and buf[1] == 'd':
+        break
+      if write(cint(sockfd), addr buf, n) <= 0:
+        break
+    if FD_ISSET(sockfd, rfds) != 0:
+      let n = read(cint(sockfd), addr buf, sizeof(buf))
+      if n <= 0:
+        break
+      if write(cint(STDOUT_FILENO), addr buf, n) <= 0:
+        break
+
+## ─── MAIN: MODE SELECTION AND ERROR HANDLING ─────────────────────────────
+
+when isMainModule:
+  try:
+    if paramCount() < 1:
+      echo "Usage: nimscreen new|attach"
+      quit(1)
+    let mode = paramStr(1)
+    case mode
+    of "new":
+      runServer()
+    of "attach":
+      attachSession()
+    else:
+      echo "Unknown mode. Use 'new' or 'attach'."
+  except OSError as e:
+    echo "Error: ", e.msg
+    quit(1)
