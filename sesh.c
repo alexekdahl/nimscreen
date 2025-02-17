@@ -1,10 +1,14 @@
 /*
-   mydetach.c -- A minimal, dtach-like tool using a daemon + forkpty.
+   sesh -- A minimal, dtach-like tool using a daemon + forkpty.
 
-   Single-file demonstration. Not production-quality!
+   No production-quality!
    (C) 2025 Example. MIT License, or use as you wish.
 */
+#define _XOPEN_SOURCE 700
+#define _DEFAULT_SOURCE
+#define _BSD_SOURCE 
 
+#include <stdio.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -24,7 +28,7 @@
 /**********************************************************************
  *                              CONSTANTS
  **********************************************************************/
-static const char *SOCKET_PATH = "/tmp/mydetach.sock";
+static const char *SOCKET_PATH = "/tmp/sesh.sock";
 static const int MAX_ATTEMPTS = 5;
 static const unsigned int ATTACH_DETACH_KEY = 0x1D; // Ctrl-]
 
