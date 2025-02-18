@@ -1,5 +1,5 @@
 /*
-   sesh -- A minimal, dtach-like tool using a daemon + forkpty.
+   nimt -- A minimal, dtach-like tool using a daemon + forkpty.
 
    No production-quality!
    (C) 2025 Example. MIT License, or use as you wish.
@@ -28,7 +28,7 @@
 /**********************************************************************
  *                              CONSTANTS
  **********************************************************************/
-static const char *SOCKET_PATH = "/tmp/sesh.sock";
+static const char *SOCKET_PATH = "/tmp/nimt.sock";
 static const int MAX_ATTEMPTS = 5;
 static const unsigned int ATTACH_DETACH_KEY = 0x1D; // Ctrl-]
 

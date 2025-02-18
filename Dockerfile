@@ -1,4 +1,4 @@
-FROM debian:bookworm AS build
+FROM debian:bullseye-slim
 
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -7,5 +7,3 @@ RUN apt-get update && apt-get install -y \
     gcc-mipsel-linux-gnu \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /src
-COPY sesh.c .
