@@ -158,9 +158,13 @@ static void handle_spawn(int client_sock, char *cmdline) {
     }
 
     if (child_pid == 0) {
+        char *shell = getenv("SHELL");
+        if (!shell || !*shell) {
+            shell = "/bin/sh";
+        }
         signal(SIGHUP, SIG_IGN);
         setsid();
-        execl("/bin/sh", "sh", "-c", command_str, (char *)NULL);
+        execl(shell, "sh", "-c", command_str, (char *)NULL);
         _exit(127);
     }
 
