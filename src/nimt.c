@@ -25,12 +25,15 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+
 /**********************************************************************
  *                              CONSTANTS
  **********************************************************************/
 static const char *SOCKET_PATH = "/tmp/nimt.sock";
 static const int MAX_ATTEMPTS = 5;
 static const unsigned int ATTACH_DETACH_KEY = 0x1D; // Ctrl-]
+static const char *CGROUP_PATH = "/sys/fs/cgroup/nimt/cgroup.procs";
+static const char *CGROUP_FOLDER = "/sys/fs/cgroup/nimt";
 
 /**********************************************************************
  *                           SESSION STRUCT
@@ -55,6 +58,43 @@ static int g_sigchld_pipe[2];         // Self-pipe for SIGCHLD handling
 /**********************************************************************
  *                           UTIL FUNCTIONS
  **********************************************************************/
+
+// Move the current process to a cgroup
+void move_to_cgroup(const char *cgroup_path) {
+    int fd = open(cgroup_path, O_WRONLY);
+    if (fd < 0) {
+        perror("open cgroup.procs");
+        return;
+    }
+    char pid_str[32];
+    snprintf(pid_str, sizeof(pid_str), "%d", getpid());
+    if (write(fd, pid_str, strlen(pid_str)) < 0) {
+        perror("write to cgroup.procs");
+    }
+    close(fd);
+}
+
+int mkdirp(const char *folder) {
+    struct stat st;
+    if (stat(folder, &st) == 0) {
+        if (S_ISDIR(st.st_mode)) {
+            return 0;
+        } else {
+            fprintf(stderr, "Error: %s exists but is not a directory.\n", folder);
+            return -1;
+        }
+    } else {
+        if (errno != ENOENT) {
+            perror("stat");
+            return -1;
+        }
+        if (mkdir(folder, 0755) != 0) {
+            perror("mkdir");
+            return -1;
+        }
+    }
+    return 0;
+}
 
 // Print an error message and exit
 static void perror_exit(const char *msg) {
@@ -111,6 +151,84 @@ static void remove_session(Session *s) {
         }
         pp = &((*pp)->next);
     }
+}
+
+// Function to move the daemon process to the parent cgroup
+static void move_self_to_parent_cgroup(void) {
+    // The parent cgroup is typically the root: /sys/fs/cgroup/
+    const char *parent_procs = "/sys/fs/cgroup/cgroup.procs";
+    int fd = open(parent_procs, O_WRONLY);
+    if (fd < 0) {
+        perror("open parent cgroup.procs");
+        return;
+    }
+    char pid_str[32];
+    snprintf(pid_str, sizeof(pid_str), "%d", getpid());
+    if (write(fd, pid_str, strlen(pid_str)) < 0) {
+        perror("write to parent cgroup.procs");
+    }
+    close(fd);
+}
+
+static void cleanup_resources(void) {
+    Session *p = g_sessions;
+    while (p) {
+        kill(p->child_pid, SIGKILL);
+        close(p->master_fd);
+        Session *temp = p;
+        p = p->next;
+        free(temp);
+    }
+    g_sessions = NULL;
+
+    // Wait for all child processes to exit.
+    while (1) {
+        int status;
+        pid_t pid = waitpid(-1, &status, WNOHANG);
+        if (pid > 0) {
+            continue;
+        } else if (pid == 0) {
+            usleep(100000);
+            continue;
+        } else {
+            if (errno == ECHILD)
+                break;
+            else
+                break;
+        }
+    }
+
+    if (g_server_sock != -1) {
+        close(g_server_sock);
+        unlink(SOCKET_PATH);
+        g_server_sock = -1;
+    }
+
+    close(g_sigchld_pipe[0]);
+    close(g_sigchld_pipe[1]);
+
+    move_self_to_parent_cgroup();
+
+    if (rmdir(CGROUP_FOLDER) != 0) {
+        perror("rmdir CGROUP_FOLDER");
+    }
+}
+
+
+static void sigterm_handler(int signo) {
+    (void)signo;  // Unused parameter.
+    cleanup_resources();
+    exit(0);
+}
+
+// Add signal handlers for SIGTERM and SIGINT
+static void setup_signal_handlers(void) {
+    struct sigaction sa_term;
+    memset(&sa_term, 0, sizeof(sa_term));
+    sa_term.sa_handler = sigterm_handler;
+    sa_term.sa_flags = SA_RESTART;
+    sigaction(SIGTERM, &sa_term, NULL);
+    sigaction(SIGINT, &sa_term, NULL);
 }
 
 /**********************************************************************
@@ -258,6 +376,8 @@ static void daemon_loop(void) {
     sa.sa_flags = SA_RESTART;
     sigaction(SIGCHLD, &sa, NULL);
 
+    setup_signal_handlers();
+
     unlink(SOCKET_PATH);
     g_server_sock = socket(AF_UNIX, SOCK_STREAM, 0);
     if (g_server_sock < 0) perror_exit("socket");
@@ -348,6 +468,9 @@ static void start_daemon(void) {
     if (pid < 0) perror_exit("fork");
     if (pid == 0) {
         setsid();
+        mkdirp(CGROUP_FOLDER);
+        move_to_cgroup(CGROUP_PATH);
+
         daemon_loop();
         exit(0);
     }
@@ -488,15 +611,6 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 1;
     }
-
-    // hack
-    if (geteuid() == 0) {
-        if (unshare(CLONE_NEWCGROUP) != 0) {
-            perror("unshare(CLONE_NEWCGROUP)");
-            exit(EXIT_FAILURE);
-        }
-    }
-
     if (strcmp(argv[1], "spawn") == 0) {
         client_spawn(argc, argv);
     } else if (strcmp(argv[1], "list") == 0) {
