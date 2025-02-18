@@ -1,30 +1,30 @@
 /*
-   nimt -- A minimal, dtach-like tool using a daemon + forkpty.
+   nimt -- A minimal, dtach-like tool.
 
-   No production-quality!
-   (C) 2025 Example. MIT License, or use as you wish.
+   (C) WTFPL License.
 */
-#define _XOPEN_SOURCE 700
+#define _BSD_SOURCE
 #define _DEFAULT_SOURCE
-#define _BSD_SOURCE 
+#define _GNU_SOURCE
+#define _XOPEN_SOURCE 700
 
-#include <stdio.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pty.h>
+#include <sched.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <signal.h>
-#include <errno.h>
-#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
-#include <sys/types.h>
-#include <sys/select.h>
-#include <sys/ioctl.h>
-#include <pty.h>
 #include <termios.h>
-
+#include <unistd.h>
 /**********************************************************************
  *                              CONSTANTS
  **********************************************************************/
@@ -56,6 +56,7 @@ static int g_sigchld_pipe[2];         // Self-pipe for SIGCHLD handling
  *                           UTIL FUNCTIONS
  **********************************************************************/
 
+// Print an error message and exit
 static void perror_exit(const char *msg) {
     perror(msg);
     exit(EXIT_FAILURE);
@@ -486,6 +487,14 @@ int main(int argc, char **argv) {
     if (argc < 2) {
         usage(argv[0]);
         return 1;
+    }
+
+    // hack
+    if (geteuid() == 0) {
+        if (unshare(CLONE_NEWCGROUP) != 0) {
+            perror("unshare(CLONE_NEWCGROUP)");
+            exit(EXIT_FAILURE);
+        }
     }
 
     if (strcmp(argv[1], "spawn") == 0) {
